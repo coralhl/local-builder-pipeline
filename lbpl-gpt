@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+
+waiting_interval=10 # In seconds
+timeout=300         # In seconds
+
+print_usage() {
+    echo ""
+    echo "NAME"
+    echo "    lbpl -- keeps a git repository in sync with its origin,"
+    echo "            sync submodules if you need"
+    echo "SYNOPSIS"
+    echo "    lbpl -d <directory> [-s]"
+    echo "DESCRIPTION"
+    echo "    The following options are available:"
+    echo "    -d    The path to the git repository"
+    echo "    -s    Check submodules"
+    echo ""
+    exit 1
+}
+
+check_arg() {
+    if [[ $2 == -* ]]; then
+        echo "Option $1 requires an argument" >&2
+        exit 1
+    fi
+}
+
+parse_param() {
+    if [ -z "$1" ]; then
+        echo "Empty list of options" >&2
+        print_usage
+    fi
+    while getopts ":d:s" opt; do
+        case $opt in
+        d)
+            check_arg "-d" "$OPTARG"
+            git_repository_dir=${OPTARG}
+            ;;
+        s)
+            check_submodules=true
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            print_usage
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument" >&2
+            print_usage
+            ;;
+        esac
+    done
+}
+
+validate_git_directory() {
+    if [[ -z "$git_repository_dir" ]]; then
+        echo -e "\nERROR: Git directory (-d) not given!" >&2
+        print_usage
+    fi
+
+    if [[ ! -d "$git_repository_dir/.git" ]] || [[ ! -r "$git_repository_dir/.git" ]]; then
+        echo "ERROR: Git directory (-d) not found: '$git_repository_dir/.git'!" >&2
+        print_usage
+    fi
+
+    if [[ ! -w "$git_repository_dir/.git" ]]; then
+        echo "ERROR: Missing write permissions for the git directory (-d): '$git_repository_dir/.git'!" >&2
+        print_usage
+    fi
+
+    # Convert to absolute file path if necessary
+    if [[ "$git_repository_dir" != /* ]]; then
+        git_repository_dir="$PWD/$git_repository_dir"
+    fi
+}
+
+pull_change() {
+    git pull
+    exit_code=$?
+
+    commit_message=$(git log -1 --pretty=format:"%h | %an | %ad | %s")
+
+    if [[ $exit_code -eq 1 ]]; then
+        echo "Pull failed --> Exiting: $1 $2 $commit_message"
+        exit 1
+    else
+        echo "Changes pulled: $1 $2 $(printf '%q\n' "$commit_message")"
+    fi
+}
+
+check_git_lock() {
+    local seconds=0
+    local timeout_remaining=$timeout
+
+    ((timeout_remaining=timeout-$waiting_interval))
+    until [ ! -f ".git/index.lock" ]; do
+        if (( seconds > timeout_remaining )); then
+            echo "Giving up..."
+            exit 1
+        fi
+        echo "ERROR: Git repository is locked, waiting to unlock..."
+        ((seconds+=waiting_interval))
+        sleep $waiting_interval
+    done
+}
+
+main_script() {
+    cd "$git_repository_dir" || exit 1
+
+    git fetch
+
+    repo_name=$(basename -s .git "$(git config --get remote.origin.url)")
+
+    previous_branch="$branch"
+    branch=$(git branch --show-current)
+
+    if [[ -z $branch ]]; then
+        echo "ERROR: Unable to get branch" >&2
+        exit 1
+    fi
+
+    if [[ -n $previous_branch ]] && [[ "$previous_branch" != "$branch" ]]; then
+        echo "Branch changed: $repo_name $branch $previous_branch"
+    fi
+
+    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null)
+
+    if [[ -z "$upstream" ]]; then
+        echo "Upstream not set: $repo_name $branch"
+    fi
+
+    git_local=$(git rev-parse @)
+    git_remote=$(git rev-parse "$upstream")
+    git_base=$(git merge-base @ "$upstream")
+
+    if [[ -z $started ]]; then
+        started=true
+    fi
+
+    rep_pull=0
+    sm_pull=0
+
+    if [[ "$git_local" == "$git_remote" ]]; then
+        echo "Nothing changed: $repo_name $branch"
+    elif [[ "$git_local" == "$git_base" ]]; then
+        pull_change "$repo_name" "$branch"
+        rep_pull=1
+    elif [[ "$git_remote" == "$git_base" ]]; then
+        echo "local file changed: $repo_name $branch"
+    else
+        echo "Diverged --> Exiting: $repo_name $branch"
+        exit 1
+    fi
+
+    if [[ $check_submodules ]]; then
+        sm_list=$(git config --file .gitmodules --get-regexp path | awk '{ print $2 }')
+        arrSHA1=()
+        arrSHA2=()
+
+        for sm_name in $sm_list; do
+            arrSHA1+=($(git submodule status "$sm_name" | awk '{print $1}'))
+        done
+
+        git submodule update --remote --recursive
+
+        for sm_name in $sm_list; do
+            arrSHA2+=($(git submodule status "$sm_name" | awk '{print $1}'))
+        done
+
+        for i in "${!arrSHA1[@]}"; do
+            if [ "${arrSHA1[$i]}" != "${arrSHA2[$i]}" ]; then
+                ((sm_pull++))
+            fi
+        done
+
+        if [ $sm_pull -eq 0 ]; then
+            echo "Submodules have not changed"
+        else
+            echo "Submodules changed"
+        fi
+    fi
+
+    if [ $rep_pull -ne 0 ] || [ $sm_pull -ne 0 ]; then
+        echo "1"
+    else
+        echo "0"
+    fi
+}
+
+parse_param "$@"
+validate_git_directory
+check_git_lock
+main_script
